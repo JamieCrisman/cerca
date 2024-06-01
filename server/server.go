@@ -145,6 +145,41 @@ func (ware *RateLimitingWare) Handler(next http.Handler) http.Handler {
 	})
 }
 
+type ctxKeyUser struct{}
+
+func UserContextMiddleware(session *session.Session, db *database.DB, next http.Handler) http.Handler {
+	return http.HandlerFunc(func(res http.ResponseWriter, req *http.Request) {
+		userid, err := session.Get(req)
+		if err != nil || userid == -1 {
+			next.ServeHTTP(res, req)
+			return
+		}
+
+		ctx := req.Context()
+		user, err := db.GetUserByID(userid)
+		if err != nil || user.ID == -1 {
+			next.ServeHTTP(res, req)
+			return
+		}
+		ctx = context.WithValue(ctx, ctxKeyUser{}, user)
+		req = req.WithContext(ctx)
+
+		next.ServeHTTP(res, req)
+	})
+}
+
+func GetCtxUser(ctx context.Context) (database.User, bool) {
+	if ctx == nil {
+		return database.User{ID: -1}, false
+	}
+
+	user, ok := ctx.Value(ctxKeyUser{}).(database.User)
+	if !ok {
+		return database.User{ID: -1}, false
+	}
+	return user, ok
+}
+
 // returns true if logged in, and the userid of the logged in user.
 // returns false (and userid set to -1) if not logged in
 func (h RequestHandler) IsLoggedIn(req *http.Request) (bool, int) {
@@ -833,7 +868,12 @@ func Serve(allowlist []string, sessionKey string, isdev bool, dir string, conf t
 		port = ":8277"
 	}
 
-	forum, err := NewServer(allowlist, sessionKey, dir, conf)
+	preparedDir := directory(dir)
+	dbpath := filepath.Join(preparedDir, "forum.db")
+	db := database.InitDB(dbpath)
+	session := session.New(sessionKey, developing)
+
+	forum, err := NewServer(allowlist, &db, session, preparedDir, conf)
 	if err != nil {
 		util.Check(err, "instantiate CercaForum")
 	}
@@ -844,8 +884,10 @@ func Serve(allowlist []string, sessionKey string, isdev bool, dir string, conf t
 	}
 	fmt.Println("Serving forum on", port)
 
+	userMiddleware := UserContextMiddleware(session, &db, forum)
+
 	rateLimitingInstance := NewRateLimitingWare([]string{"/rss/", "/rss.xml"})
-	limitingMiddleware := rateLimitingInstance.Handler(forum)
+	limitingMiddleware := rateLimitingInstance.Handler(userMiddleware)
 	http.Serve(l, limitingMiddleware)
 }
 
@@ -858,29 +900,26 @@ type CercaForum struct {
 	Directory string
 }
 
-func (u *CercaForum) directory() string {
-	if u.Directory == "" {
+func directory(directory string) string {
+	if directory == "" {
 		dir, err := os.Getwd()
 		if err != nil {
 			log.Fatal(err)
 		}
-		u.Directory = filepath.Join(dir, "CercaForum")
+		directory = filepath.Join(dir, "CercaForum")
 	}
-	os.MkdirAll(u.Directory, 0755)
-	return u.Directory
+	os.MkdirAll(directory, 0755)
+	return directory
 }
 
 // NewServer sets up a new CercaForum object. Always use this to initialize
 // new CercaForum objects. Pass the result to http.Serve() with your choice
 // of net.Listener.
-func NewServer(allowlist []string, sessionKey, dir string, config types.Config) (*CercaForum, error) {
+func NewServer(allowlist []string, db *database.DB, session *session.Session, dir string, config types.Config) (*CercaForum, error) {
 	s := &CercaForum{
 		ServeMux:  http.ServeMux{},
 		Directory: dir,
 	}
-
-	dbpath := filepath.Join(s.directory(), "forum.db")
-	db := database.InitDB(dbpath)
 
 	config.EnsureDefaultPaths()
 	// load the documents specified in the config
@@ -906,8 +945,8 @@ func NewServer(allowlist []string, sessionKey, dir string, config types.Config) 
 	// for currently translated languages, see i18n/i18n.go
 	translator := i18n.Init(config.Community.Language)
 	templates := template.Must(generateTemplates(config, translator))
-	feed := GenerateRSS(&db, config)
-	handler := RequestHandler{&db, session.New(sessionKey, developing), allowlist, files, config, translator, templates, feed}
+	feed := GenerateRSS(db, config)
+	handler := RequestHandler{db, session, allowlist, files, config, translator, templates, feed}
 
 	/* note: be careful with trailing slashes; go's default handler is a bit sensitive */
 	// TODO (2022-01-10): introduce middleware to make sure there is never an issue with trailing slashes
