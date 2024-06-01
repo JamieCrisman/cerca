@@ -464,6 +464,9 @@ func (h RequestHandler) LoginRoute(res http.ResponseWriter, req *http.Request) {
 	_, loggedIn := GetCtxUser(req.Context())
 	switch req.Method {
 	case "GET":
+		if loggedIn {
+			IndexRedirect(res, req)
+		}
 		data := newTemplateData(req.Context(), h.config, h.translator.Translate("Login"), LoginData{})
 		h.renderView(res, "login", data)
 	case "POST":
