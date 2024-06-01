@@ -43,6 +43,27 @@ type TemplateData struct {
 	Title      string
 }
 
+func newTemplateData(ctx context.Context, config types.Config, title string, data interface{}) TemplateData {
+	user, userOk := GetCtxUser(ctx)
+	var forumName string
+	if config.Community.Name != "" {
+		forumName = config.Community.Name
+	} else {
+		forumName = "Forum"
+	}
+
+	return TemplateData{
+		LoggedIn:   userOk,
+		IsAdmin:    user.IsAdmin,
+		LoggedInID: user.ID,
+		HasRSS:     config.RSS.URL != "",
+		QuickNav:   userOk,
+		ForumName:  forumName,
+		Title:      title,
+		Data:       data,
+	}
+}
+
 type PasswordResetData struct {
 	Action   string
 	Username string
@@ -295,13 +316,6 @@ func (h RequestHandler) renderView(res http.ResponseWriter, viewName string, dat
 		data.Title = strings.ReplaceAll(viewName, "-", " ")
 	}
 
-	if h.config.Community.Name != "" {
-		data.ForumName = h.config.Community.Name
-	}
-	if data.ForumName == "" {
-		data.ForumName = "Forum"
-	}
-
 	view := fmt.Sprintf("%s.html", viewName)
 	if err := h.templates.ExecuteTemplate(res, view, data); err != nil {
 		if errors.Is(err, syscall.EPIPE) {
@@ -314,24 +328,15 @@ func (h RequestHandler) renderView(res http.ResponseWriter, viewName string, dat
 }
 
 func (h RequestHandler) renderGenericMessage(res http.ResponseWriter, req *http.Request, incomingData GenericMessageData) {
-	loggedIn, _ := h.IsLoggedIn(req)
-	isAdmin, _ := h.IsAdmin(req)
-	data := TemplateData{
-		Data: incomingData,
-		// the following two fields are defaults that usually are not set and which are cumbersome to set each time since
-		// they don't really matter / vary across invocations
-		HasRSS:   h.config.RSS.URL != "",
-		LoggedIn: loggedIn,
-		IsAdmin:  isAdmin,
-	}
+	// Should this pull the Title out of GenericMessageData?
+	data := newTemplateData(req.Context(), h.config, "", incomingData)
 	h.renderView(res, "generic-message", data)
 	return
 }
 
 func (h *RequestHandler) ThreadRoute(res http.ResponseWriter, req *http.Request) {
 	threadid, ok := util.GetURLPortion(req, 2)
-	loggedIn, userid := h.IsLoggedIn(req)
-	isAdmin, _ := h.IsAdmin(req)
+	user, loggedIn := GetCtxUser(req.Context())
 
 	if !ok {
 		title := h.translator.Translate("ErrThread404")
@@ -349,7 +354,7 @@ func (h *RequestHandler) ThreadRoute(res http.ResponseWriter, req *http.Request)
 		// TODO (2022-01-09): make sure rendered content won't be empty after sanitizing:
 		// * run sanitize step && strings.TrimSpace and check length **before** doing AddPost
 		// TODO(2022-01-09): send errors back to thread's posting view
-		_ = h.db.AddPost(content, threadid, userid)
+		_ = h.db.AddPost(content, threadid, user.ID)
 		// we want to effectively redirect to <#posts+1> to mark the thread as read in the thread index
 		// TODO(2022-01-30): find a solution for either:
 		// * scrolling to thread bottom (and maintaining the same slug, important for visited state in browser)
@@ -365,7 +370,7 @@ func (h *RequestHandler) ThreadRoute(res http.ResponseWriter, req *http.Request)
 	// * handle error
 	thread := h.db.GetThread(threadid)
 	data := ThreadData{Posts: thread, ThreadURL: req.URL.Path}
-	view := TemplateData{Data: &data, IsAdmin: isAdmin, QuickNav: loggedIn, HasRSS: h.config.RSS.URL != "", LoggedIn: loggedIn, LoggedInID: userid}
+	view := newTemplateData(req.Context(), h.config, "", &data)
 	if len(thread) > 0 {
 		data.Title = thread[0].ThreadTitle
 		view.Title = data.Title
@@ -388,9 +393,7 @@ func (h RequestHandler) IndexRoute(res http.ResponseWriter, req *http.Request) {
 		h.ErrorRoute(res, req, http.StatusNotFound)
 		return
 	}
-	loggedIn, _ := h.IsLoggedIn(req)
 	var mostRecentPost bool
-	isAdmin, _ := h.IsAdmin(req)
 
 	params := req.URL.Query()
 	if q, exists := params["sort"]; exists {
@@ -399,7 +402,7 @@ func (h RequestHandler) IndexRoute(res http.ResponseWriter, req *http.Request) {
 	}
 	// show index listing
 	threads := h.db.ListThreads(mostRecentPost)
-	view := TemplateData{Data: IndexData{threads}, IsAdmin: isAdmin, HasRSS: h.config.RSS.URL != "", LoggedIn: loggedIn, Title: h.translator.Translate("Threads")}
+	view := newTemplateData(req.Context(), h.config, h.translator.Translate("Threads"), IndexData{threads})
 	h.renderView(res, "index", view)
 }
 
@@ -449,7 +452,7 @@ func (h *RequestHandler) RSSRoute(res http.ResponseWriter, req *http.Request) {
 }
 
 func (h RequestHandler) LogoutRoute(res http.ResponseWriter, req *http.Request) {
-	loggedIn, _ := h.IsLoggedIn(req)
+	_, loggedIn := GetCtxUser(req.Context())
 	if loggedIn {
 		h.session.Delete(res, req)
 	}
@@ -458,10 +461,11 @@ func (h RequestHandler) LogoutRoute(res http.ResponseWriter, req *http.Request) 
 
 func (h RequestHandler) LoginRoute(res http.ResponseWriter, req *http.Request) {
 	ed := util.Describe("LoginRoute")
-	loggedIn, _ := h.IsLoggedIn(req)
+	_, loggedIn := GetCtxUser(req.Context())
 	switch req.Method {
 	case "GET":
-		h.renderView(res, "login", TemplateData{Data: LoginData{}, HasRSS: h.config.RSS.URL != "", LoggedIn: loggedIn, Title: h.translator.Translate("Login")})
+		data := newTemplateData(req.Context(), h.config, h.translator.Translate("Login"), LoginData{})
+		h.renderView(res, "login", data)
 	case "POST":
 		username := req.PostFormValue("username")
 		password := req.PostFormValue("password")
@@ -473,7 +477,8 @@ func (h RequestHandler) LoginRoute(res http.ResponseWriter, req *http.Request) {
 		}
 		if err != nil {
 			fmt.Println(err)
-			h.renderView(res, "login", TemplateData{Data: LoginData{FailedAttempt: true}, HasRSS: h.config.RSS.URL != "", LoggedIn: loggedIn, Title: h.translator.Translate("Login")})
+			data := newTemplateData(req.Context(), h.config, h.translator.Translate("Login"), LoginData{FailedAttempt: true})
+			h.renderView(res, "login", data)
 			return
 		}
 		// save user id in cookie
@@ -515,7 +520,7 @@ func (h RequestHandler) handleChangePassword(res http.ResponseWriter, req *http.
 		}
 		h.renderGenericMessage(res, req, data)
 	}
-	_, uid := h.IsLoggedIn(req)
+	user, _ := GetCtxUser(req.Context())
 
 	ed := util.Describe("change password")
 	switch req.Method {
@@ -531,13 +536,7 @@ func (h RequestHandler) handleChangePassword(res http.ResponseWriter, req *http.
 			newPassword := req.PostFormValue("password-new")
 
 			// check that the submitted, old password is valid
-			username, err := h.db.GetUsername(uid)
-			if err != nil {
-				dump(ed.Eout(err, "get username"))
-				return
-			}
-
-			pwhashOld, _, err := h.db.GetPasswordHash(username)
+			pwhashOld, _, err := h.db.GetPasswordHash(user.Name)
 			if err != nil {
 				dump(ed.Eout(err, "get old password hash"))
 				return
@@ -556,7 +555,7 @@ func (h RequestHandler) handleChangePassword(res http.ResponseWriter, req *http.
 				return
 			}
 			// then save the hash
-			h.db.UpdateUserPasswordHash(uid, pwhashNew)
+			h.db.UpdateUserPasswordHash(user.ID, pwhashNew)
 			// render a success message & show a link to the login page :')
 			h.renderView(res, "change-password-success", TemplateData{HasRSS: h.config.RSS.URL != "", LoggedIn: true, Data: ChangePasswordData{}})
 		default:
@@ -570,8 +569,8 @@ func (h RequestHandler) handleChangePassword(res http.ResponseWriter, req *http.
 }
 
 func (h RequestHandler) ResetPasswordRoute(res http.ResponseWriter, req *http.Request) {
-	loggedIn, _ := h.IsLoggedIn(req)
 	title := util.Capitalize(h.translator.Translate("PasswordReset"))
+	_, loggedIn := GetCtxUser(req.Context())
 
 	// the user was logged in, let them change their password themselves :)
 	if loggedIn {
@@ -596,7 +595,7 @@ func (h RequestHandler) ResetPasswordRoute(res http.ResponseWriter, req *http.Re
 
 func (h RequestHandler) RegisterRoute(res http.ResponseWriter, req *http.Request) {
 	ed := util.Describe("register route")
-	loggedIn, _ := h.IsLoggedIn(req)
+	_, loggedIn := GetCtxUser(req.Context())
 	if loggedIn {
 		// TODO (2022-09-20): translate
 		data := GenericMessageData{
@@ -698,7 +697,11 @@ func (h RequestHandler) RegisterRoute(res http.ResponseWriter, req *http.Request
 		if err = ed.Eout(err, "add registration"); err != nil {
 			dump(err)
 		}
-		h.renderView(res, "register-success", TemplateData{HasRSS: h.config.RSS.URL != "", LoggedIn: true, Title: h.translator.Translate("RegisterSuccess")})
+		data := newTemplateData(req.Context(), h.config, h.translator.Translate("RegisterSuccess"), nil)
+		data.LoggedInID = userID
+		data.LoggedIn = true
+		data.QuickNav = true
+		h.renderView(res, "register-success", data)
 	default:
 		fmt.Println("non get/post method, redirecting to index")
 		IndexRedirect(res, req)
@@ -718,9 +721,9 @@ func (h RequestHandler) GenericRoute(res http.ResponseWriter, req *http.Request)
 }
 
 func (h RequestHandler) AboutRoute(res http.ResponseWriter, req *http.Request) {
-	loggedIn, _ := h.IsLoggedIn(req)
 	input := util.Markup(string(h.files["about"]))
-	h.renderView(res, "about-template", TemplateData{Data: input, HasRSS: h.config.RSS.URL != "", LoggedIn: loggedIn, Title: h.translator.Translate("About")})
+	data := newTemplateData(req.Context(), h.config, h.translator.Translate("About"), input)
+	h.renderView(res, "about-template", data)
 }
 
 func (h RequestHandler) RobotsRoute(res http.ResponseWriter, req *http.Request) {
@@ -779,7 +782,7 @@ func (h *RequestHandler) DeletePostRoute(res http.ResponseWriter, req *http.Requ
 	}
 	threadURL := req.PostFormValue("thread")
 	postid, ok := util.GetURLPortion(req, 3)
-	loggedIn, userid := h.IsLoggedIn(req)
+	user, loggedIn := GetCtxUser(req.Context())
 
 	// generic error message base, with specifics being swapped out depending on the error
 	genericErr := GenericMessageData{
@@ -807,7 +810,7 @@ func (h *RequestHandler) DeletePostRoute(res http.ResponseWriter, req *http.Requ
 		return
 	}
 
-	authorized := post.AuthorID == userid
+	authorized := post.AuthorID == user.ID
 	switch req.Method {
 	case "POST":
 		if authorized {
@@ -822,6 +825,9 @@ func (h *RequestHandler) DeletePostRoute(res http.ResponseWriter, req *http.Requ
 			return
 		}
 		// update the rss feed, in case the deleted post was present in feed
+		// NOTE: this is a concurrent write,
+		// if someone else is requesting the RSS feed at the same time,
+		// they may receive corrupt data
 		h.rssFeed = GenerateRSS(h.db, h.config)
 	}
 	http.Redirect(res, req, threadURL, http.StatusSeeOther)
@@ -829,7 +835,7 @@ func (h *RequestHandler) DeletePostRoute(res http.ResponseWriter, req *http.Requ
 
 func (h *RequestHandler) EditPostRoute(res http.ResponseWriter, req *http.Request) {
 	postid, ok := util.GetURLPortion(req, 3)
-	loggedIn, userid := h.IsLoggedIn(req)
+	user, loggedIn := GetCtxUser(req.Context())
 	post, err := h.db.GetPost(postid)
 
 	if !ok || errors.Is(err, sql.ErrNoRows) {
@@ -841,7 +847,7 @@ func (h *RequestHandler) EditPostRoute(res http.ResponseWriter, req *http.Reques
 		h.renderGenericMessage(res, req, data)
 		return
 	}
-	if !loggedIn || userid != post.AuthorID {
+	if !loggedIn || user.ID != post.AuthorID {
 		res.WriteHeader(401)
 		title := h.translator.Translate("ErrGeneric401")
 		data := GenericMessageData{
@@ -856,7 +862,7 @@ func (h *RequestHandler) EditPostRoute(res http.ResponseWriter, req *http.Reques
 		h.db.EditPost(content, postid)
 		post.Content = content
 	}
-	view := TemplateData{Data: post, QuickNav: loggedIn, HasRSS: h.config.RSS.URL != "", LoggedIn: loggedIn, LoggedInID: userid}
+	view := newTemplateData(req.Context(), h.config, "", post)
 	h.renderView(res, "edit-post", view)
 }
 
