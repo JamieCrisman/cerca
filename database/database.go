@@ -389,6 +389,19 @@ func (d DB) CreateUser(name, hash string) (int, error) {
 	return userid, nil
 }
 
+func (d DB) GetUserByID(uid int) (User, error) {
+	stmt := `
+SELECT users.id, users.name,(admins.id is not null) FROM users LEFT JOIN admins on admins.id = users.id
+WHERE users.id = ?
+`
+	var user User
+	err := d.db.QueryRow(stmt, uid).Scan(&user.ID, &user.Name, &user.IsAdmin)
+	if err != nil {
+		return User{ID: -1}, util.Eout(err, "get user id")
+	}
+	return user, nil
+}
+
 func (d DB) GetUserID(name string) (int, error) {
 	stmt := `SELECT id FROM users where name = ?`
 	var userid int

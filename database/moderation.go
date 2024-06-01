@@ -417,8 +417,9 @@ func (d DB) FinalizeProposedAction(proposalid, adminid int, decision bool) (fina
 }
 
 type User struct {
-	Name string
-	ID   int
+	Name    string
+	ID      int
+	IsAdmin bool
 }
 
 func (d DB) AddAdmin(userid int) error {
@@ -487,9 +488,9 @@ func (d DB) QuorumActivated() bool {
 
 func (d DB) GetAdmins() []User {
 	ed := util.Describe("get admins")
-	query := `SELECT u.name, a.id 
-  FROM users u 
-  INNER JOIN admins a ON u.id = a.id 
+	query := `SELECT u.name, a.id, (a.id is not null)
+  FROM users u
+  INNER JOIN admins a ON u.id = a.id
   ORDER BY u.name
   `
 	stmt, err := d.db.Prepare(query)
@@ -503,7 +504,7 @@ func (d DB) GetAdmins() []User {
 	var user User
 	var admins []User
 	for rows.Next() {
-		if err := rows.Scan(&user.Name, &user.ID); err != nil {
+		if err := rows.Scan(&user.Name, &user.ID, &user.IsAdmin); err != nil {
 			ed.Check(err, "scanning loop")
 		}
 		admins = append(admins, user)
